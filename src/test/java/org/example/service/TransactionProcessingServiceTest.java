@@ -4,6 +4,7 @@ import org.example.model.TransactionEvent;
 import org.junit.jupiter.api.Test;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
@@ -221,7 +222,7 @@ public class TransactionProcessingServiceTest {
         service.shutdown();
         Thread.sleep(200);
 
-        assertThat(service.getConsumerPool().isTerminated()).isTrue();
+        assertThat(service.isConsumerPoolTerminated()).isTrue();
     }
 
     @Test
@@ -245,12 +246,50 @@ public class TransactionProcessingServiceTest {
         service.shutdown();
         Thread.sleep(50);
 
-        assertThat(service.getConsumerPool().getActiveCount()).isGreaterThan(0);
+        assertThat(service.getConsumerPoolActiveCount()).isGreaterThan(0);
 
         holdConsumers.countDown();
         Thread.sleep(2000);
 
-        assertThat(service.getConsumerPool().isTerminated()).isTrue();
+        assertThat(service.isConsumerPoolTerminated()).isTrue();
+    }
+
+    @Test
+    void givenTwoTxIdsWhenProcessCalledThenSameTxIdIsSequentialAndDifferentTxIdsAreParallel() throws InterruptedException {
+        int eventsPerTx = 3;
+        CountDownLatch allDone = new CountDownLatch(eventsPerTx * 2);
+        ConcurrentHashMap<String, AtomicInteger> activeCounts = new ConcurrentHashMap<>();
+        AtomicInteger concurrentSameTxId = new AtomicInteger(0);
+        AtomicLong maxEndTime = new AtomicLong(0);
+
+        TransactionProcessingService service = new TransactionProcessingService(
+                true, 4, 100,
+                event -> {},
+                event -> {
+                    AtomicInteger active = activeCounts.computeIfAbsent(event.txId(), k -> new AtomicInteger(0));
+                    if (active.incrementAndGet() > 1) {
+                        concurrentSameTxId.incrementAndGet();
+                    }
+                    try { Thread.sleep(50); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+                    active.decrementAndGet();
+                    maxEndTime.updateAndGet(prev -> Math.max(prev, System.currentTimeMillis()));
+                    allDone.countDown();
+                }
+        );
+
+        long start = System.currentTimeMillis();
+        for (int i = 0; i < eventsPerTx; i++) {
+            service.process(new TransactionEvent("TX-1", "event-" + i));
+            service.process(new TransactionEvent("TX-2", "event-" + i));
+        }
+
+        allDone.await(5, TimeUnit.SECONDS);
+        long elapsed = maxEndTime.get() - start;
+
+
+        assertThat(elapsed).isLessThan(500);
+        assertThat(concurrentSameTxId.get()).isEqualTo(0);
+        service.shutdown();
     }
 
 }
